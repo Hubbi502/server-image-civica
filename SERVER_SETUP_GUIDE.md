@@ -1,589 +1,524 @@
-# Panduan Konfigurasi Server Storage - CIVICA
+# 🏛️ Panduan Setup Server CIVICA dengan Cloudflare Tunnel
 
-## Overview
+## 📖 Overview
 
-Panduan ini menjelaskan cara setup server pribadi untuk menggantikan Firebase Storage dengan menggunakan subdomain `storage.sangkaraprasetya.site`.
+Panduan ini menjelaskan cara setup **server pribadi (private server)** untuk CIVICA Storage API menggunakan **Cloudflare Tunnel**. Dengan teknik tunneling ini, server tidak memerlukan IP publik atau port forwarding - Cloudflare Tunnel akan membuat koneksi aman dari server ke jaringan Cloudflare.
+
+### Kenapa Cloudflare Tunnel?
+
+- ✅ **Tidak perlu IP publik** - Server bisa di belakang NAT/firewall
+- ✅ **SSL/TLS otomatis** - Cloudflare handle semua sertifikat
+- ✅ **Tidak perlu buka port** - Lebih aman, tidak ada port yang exposed
+- ✅ **DDoS Protection** - Built-in dari Cloudflare
+- ✅ **Gratis** - Cloudflare Tunnel gratis digunakan
 
 ---
 
 ## 🏗️ Arsitektur
 
 ```
-┌─────────────────┐      ┌──────────────────────────┐      ┌─────────────────┐
-│   CIVICA App    │ ───► │  storage.sangkaraprasetya │ ───► │  Private Server │
-│  (React Native) │      │         .site             │      │  (File Storage) │
-└─────────────────┘      └──────────────────────────┘      └─────────────────┘
-                                    │
-                                    ▼
-                         ┌──────────────────────────┐
-                         │   Cloudflare Tunnel /    │
-                         │   Nginx Reverse Proxy    │
-                         └──────────────────────────┘
+┌─────────────────┐         HTTPS          ┌──────────────────────────┐
+│   CIVICA App    │ ◄────────────────────► │   Cloudflare Network     │
+│  (React Native) │                        │  (storage.sangkaraprasetya│
+└─────────────────┘                        │         .site)           │
+                                           └────────────┬─────────────┘
+                                                        │
+                                              Cloudflare Tunnel
+                                           (Outbound connection)
+                                                        │
+                                                        ▼
+                                           ┌──────────────────────────┐
+                                           │   🏠 PRIVATE SERVER      │
+                                           │   (Di rumah/kantor)      │
+                                           │   ┌──────────────────┐   │
+                                           │   │ cloudflared      │   │
+                                           │   │ daemon           │   │
+                                           │   └────────┬─────────┘   │
+                                           │            │             │
+                                           │   ┌────────▼─────────┐   │
+                                           │   │ Node.js API      │   │
+                                           │   │ (localhost:3001) │   │
+                                           │   └──────────────────┘   │
+                                           │            │             │
+                                           │   ┌────────▼─────────┐   │
+                                           │   │ File Storage     │   │
+                                           │   │ /uploads/        │   │
+                                           │   └──────────────────┘   │
+                                           └──────────────────────────┘
 ```
+
+**Alur Kerja:**
+
+1. CIVICA App request ke `https://storage.sangkaraprasetya.site`
+2. Request masuk ke Cloudflare Network
+3. Cloudflare meneruskan request melalui tunnel ke `cloudflared` daemon
+4. `cloudflared` forward request ke Node.js API di `localhost:3001`
+5. Response dikirim balik melalui jalur yang sama
 
 ---
 
-## 📋 Langkah-langkah Konfigurasi
+## 📋 Prerequisites
 
-### **STEP 1: Persiapan Server**
+| Kebutuhan          | Keterangan                                |
+| ------------------ | ----------------------------------------- |
+| Server Linux       | Ubuntu 20.04+, Debian, atau distro lain   |
+| Node.js            | Versi 18 atau lebih baru                  |
+| Domain             | `sangkaraprasetya.site` (sudah ada)       |
+| Cloudflare Account | Gratis, domain sudah di-manage Cloudflare |
+| Internet           | Koneksi stabil (upload speed penting)     |
 
-#### 1.1 Requirements
+> ⚠️ **Tidak perlu:** IP publik, port forwarding, SSL certificate manual, Nginx
 
-- Server dengan OS Linux (Ubuntu 20.04+ recommended)
-- Node.js 18+ atau Python 3.9+
-- Nginx
-- Domain: `sangkaraprasetya.site` (sudah dimiliki)
-- SSL Certificate (Let's Encrypt)
+---
 
-#### 1.2 Install Dependencies di Server
+## 🚀 STEP 1: Persiapan Server
+
+### 1.1 Update Sistem
 
 ```bash
-# Update system
 sudo apt update && sudo apt upgrade -y
+```
 
-# Install Node.js 18
+### 1.2 Install Node.js 18+
+
+```bash
+# Install Node.js via NodeSource
 curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
 sudo apt install -y nodejs
 
-# Install Nginx
-sudo apt install -y nginx
+# Verifikasi instalasi
+node --version  # Harus v18.x.x atau lebih
+npm --version
+```
 
-# Install Certbot untuk SSL
-sudo apt install -y certbot python3-certbot-nginx
+### 1.3 Install PM2 (Process Manager)
 
-# Install PM2 untuk process management
+```bash
 sudo npm install -g pm2
 ```
 
----
-
-### **STEP 2: Setup Storage API Server**
-
-#### 2.1 Buat Folder Project
+### 1.4 Install Cloudflared
 
 ```bash
-# Di server
-mkdir -p /var/www/storage-api
-cd /var/www/storage-api
+# Download dan install cloudflared
+curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+sudo dpkg -i cloudflared.deb
 
-# Buat struktur folder
-mkdir -p uploads/posts uploads/avatars
+# Verifikasi instalasi
+cloudflared --version
+
+# Cleanup
+rm cloudflared.deb
 ```
 
-#### 2.2 Inisialisasi Project
+---
+
+## 🚀 STEP 2: Setup Storage API
+
+### 2.1 Buat Direktori Project
+
+```bash
+# Buat folder project
+sudo mkdir -p /var/www/civica-storage
+sudo chown -R $USER:$USER /var/www/civica-storage
+cd /var/www/civica-storage
+
+# Buat struktur folder
+mkdir -p uploads/posts uploads/avatars uploads/reports
+```
+
+### 2.2 Inisialisasi Project
 
 ```bash
 npm init -y
-npm install express multer cors sharp uuid helmet
+npm install express multer cors sharp uuid helmet dotenv
 ```
 
-#### 2.3 Buat File Server (`server.js`)
-
-```javascript
-// /var/www/storage-api/server.js
-const express = require("express");
-const multer = require("multer");
-const cors = require("cors");
-const sharp = require("sharp");
-const path = require("path");
-const fs = require("fs");
-const { v4: uuidv4 } = require("uuid");
-const helmet = require("helmet");
-
-const app = express();
-const PORT = process.env.PORT || 3001;
-
-// Security
-app.use(helmet());
-
-// CORS Configuration - sesuaikan dengan kebutuhan
-app.use(
-  cors({
-    origin: "*", // Untuk production, ganti dengan origin spesifik
-    methods: ["GET", "POST", "DELETE"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-API-Key"],
-  }),
-);
-
-// API Key untuk autentikasi (ganti dengan key yang aman!)
-const API_KEY = process.env.API_KEY || "your-super-secret-api-key-change-this";
-
-// Middleware autentikasi
-const authenticate = (req, res, next) => {
-  const apiKey = req.headers["x-api-key"];
-  if (apiKey !== API_KEY) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-  next();
-};
-
-// Storage configuration
-const storage = multer.memoryStorage();
-const upload = multer({
-  storage,
-  limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB max
-  },
-  fileFilter: (req, file, cb) => {
-    const allowedTypes = ["image/jpeg", "image/png", "image/webp", "image/gif"];
-    if (allowedTypes.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(
-        new Error("Invalid file type. Only JPEG, PNG, WebP, and GIF allowed."),
-      );
-    }
-  },
-});
-
-// Upload directory
-const UPLOAD_DIR = path.join(__dirname, "uploads");
-
-// Ensure upload directories exist
-["posts", "avatars"].forEach((dir) => {
-  const dirPath = path.join(UPLOAD_DIR, dir);
-  if (!fs.existsSync(dirPath)) {
-    fs.mkdirSync(dirPath, { recursive: true });
-  }
-});
-
-// Serve static files
-app.use("/uploads", express.static(UPLOAD_DIR));
-
-// Health check
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString() });
-});
-
-// Upload single image
-app.post(
-  "/upload/:type",
-  authenticate,
-  upload.single("image"),
-  async (req, res) => {
-    try {
-      if (!req.file) {
-        return res.status(400).json({ error: "No file uploaded" });
-      }
-
-      const type = req.params.type; // 'posts' or 'avatars'
-      if (!["posts", "avatars"].includes(type)) {
-        return res.status(400).json({ error: "Invalid upload type" });
-      }
-
-      const filename = `${Date.now()}_${uuidv4()}.jpg`;
-      const filepath = path.join(UPLOAD_DIR, type, filename);
-
-      // Compress and resize image
-      await sharp(req.file.buffer)
-        .resize(1200, 1200, { fit: "inside", withoutEnlargement: true })
-        .jpeg({ quality: 80 })
-        .toFile(filepath);
-
-      const imageUrl = `https://storage.sangkaraprasetya.site/uploads/${type}/${filename}`;
-
-      res.json({
-        success: true,
-        url: imageUrl,
-        filename,
-      });
-    } catch (error) {
-      console.error("Upload error:", error);
-      res.status(500).json({ error: "Failed to upload image" });
-    }
-  },
-);
-
-// Upload multiple images
-app.post(
-  "/upload-multiple/:type",
-  authenticate,
-  upload.array("images", 10),
-  async (req, res) => {
-    try {
-      if (!req.files || req.files.length === 0) {
-        return res.status(400).json({ error: "No files uploaded" });
-      }
-
-      const type = req.params.type;
-      if (!["posts", "avatars"].includes(type)) {
-        return res.status(400).json({ error: "Invalid upload type" });
-      }
-
-      const uploadedUrls = [];
-
-      for (const file of req.files) {
-        const filename = `${Date.now()}_${uuidv4()}.jpg`;
-        const filepath = path.join(UPLOAD_DIR, type, filename);
-
-        await sharp(file.buffer)
-          .resize(1200, 1200, { fit: "inside", withoutEnlargement: true })
-          .jpeg({ quality: 80 })
-          .toFile(filepath);
-
-        uploadedUrls.push(
-          `https://storage.sangkaraprasetya.site/uploads/${type}/${filename}`,
-        );
-      }
-
-      res.json({
-        success: true,
-        urls: uploadedUrls,
-      });
-    } catch (error) {
-      console.error("Upload error:", error);
-      res.status(500).json({ error: "Failed to upload images" });
-    }
-  },
-);
-
-// Delete image
-app.delete("/delete", authenticate, async (req, res) => {
-  try {
-    const { filename, type } = req.body;
-
-    if (!filename || !type) {
-      return res.status(400).json({ error: "Filename and type required" });
-    }
-
-    if (!["posts", "avatars"].includes(type)) {
-      return res.status(400).json({ error: "Invalid type" });
-    }
-
-    const filepath = path.join(UPLOAD_DIR, type, filename);
-
-    if (fs.existsSync(filepath)) {
-      fs.unlinkSync(filepath);
-      res.json({ success: true, message: "File deleted" });
-    } else {
-      res.status(404).json({ error: "File not found" });
-    }
-  } catch (error) {
-    console.error("Delete error:", error);
-    res.status(500).json({ error: "Failed to delete image" });
-  }
-});
-
-// Error handling
-app.use((err, req, res, next) => {
-  console.error(err);
-  res.status(500).json({ error: err.message || "Internal server error" });
-});
-
-app.listen(PORT, () => {
-  console.log(`Storage API running on port ${PORT}`);
-});
-```
-
-#### 2.4 Buat File Environment
+### 2.3 Buat File Environment
 
 ```bash
-# /var/www/storage-api/.env
-PORT=3001
-API_KEY=ganti-dengan-api-key-yang-aman-dan-random
-```
-
-#### 2.5 Start Server dengan PM2
-
-```bash
-cd /var/www/storage-api
-pm2 start server.js --name "storage-api"
-pm2 save
-pm2 startup
-```
-
----
-
-### **STEP 3: Konfigurasi Nginx**
-
-#### 3.1 Buat Nginx Config
-
-```bash
-sudo nano /etc/nginx/sites-available/storage.sangkaraprasetya.site
+nano .env
 ```
 
 Isi dengan:
 
-```nginx
-server {
-    listen 80;
-    server_name storage.sangkaraprasetya.site;
+```env
+# Port server (jangan ubah jika pakai config tunnel default)
+PORT=3001
 
-    # Redirect HTTP to HTTPS
-    return 301 https://$server_name$request_uri;
-}
+# Domain untuk generate URL
+DOMAIN=https://storage.sangkaraprasetya.site
 
-server {
-    listen 443 ssl http2;
-    server_name storage.sangkaraprasetya.site;
-
-    # SSL certificates (akan diisi setelah certbot)
-    ssl_certificate /etc/letsencrypt/live/storage.sangkaraprasetya.site/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/storage.sangkaraprasetya.site/privkey.pem;
-
-    # SSL settings
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers on;
-    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
-
-    # Max upload size
-    client_max_body_size 50M;
-
-    # Gzip
-    gzip on;
-    gzip_types text/plain application/json image/svg+xml;
-
-    # Static files (gambar)
-    location /uploads {
-        alias /var/www/storage-api/uploads;
-        expires 30d;
-        add_header Cache-Control "public, immutable";
-        add_header Access-Control-Allow-Origin "*";
-    }
-
-    # API proxy
-    location / {
-        proxy_pass http://127.0.0.1:3001;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_cache_bypass $http_upgrade;
-    }
-}
+# API Key - WAJIB DIGANTI dengan random string yang aman!
+# Generate dengan: openssl rand -hex 32
+API_KEY=GANTI_DENGAN_API_KEY_YANG_AMAN_MINIMAL_32_KARAKTER
 ```
 
-#### 3.2 Enable Site & Restart Nginx
+### 2.4 Copy File Server
+
+Copy file `server.js` dari repository ini ke `/var/www/civica-storage/server.js`
 
 ```bash
-# Hapus konfigurasi sementara untuk mendapatkan SSL dulu
-sudo rm /etc/nginx/sites-available/storage.sangkaraprasetya.site
+# Jika clone dari repo
+cp /path/to/repo/docs/server/server.js /var/www/civica-storage/
 
-# Buat konfigurasi minimal untuk certbot
-sudo nano /etc/nginx/sites-available/storage.sangkaraprasetya.site
+# Atau buat manual dengan nano/vim
+nano server.js
+# Paste isi dari file server.js di repo ini
 ```
 
-Konfigurasi minimal (untuk dapat SSL):
-
-```nginx
-server {
-    listen 80;
-    server_name storage.sangkaraprasetya.site;
-
-    location / {
-        proxy_pass http://127.0.0.1:3001;
-    }
-}
-```
+### 2.5 Test Server Lokal
 
 ```bash
-# Enable site
-sudo ln -s /etc/nginx/sites-available/storage.sangkaraprasetya.site /etc/nginx/sites-enabled/
+# Test jalankan server
+node server.js
 
-# Test config
-sudo nginx -t
-
-# Restart nginx
-sudo systemctl restart nginx
+# Output seharusnya:
+# 🚀 Storage API Server running on port 3001
+# 📁 Upload directory: /var/www/civica-storage/uploads
 ```
+
+Tekan `Ctrl+C` untuk stop.
 
 ---
 
-### **STEP 4: Setup DNS & SSL**
+## 🚀 STEP 3: Setup Cloudflare Tunnel
 
-#### 4.1 Konfigurasi DNS
-
-Di panel domain `sangkaraprasetya.site`, tambahkan DNS record:
-
-| Type | Name    | Value/Target   | TTL  |
-| ---- | ------- | -------------- | ---- |
-| A    | storage | IP_SERVER_KAMU | 3600 |
-
-Atau jika menggunakan Cloudflare Tunnel, gunakan CNAME.
-
-#### 4.2 Generate SSL Certificate
+### 3.1 Login ke Cloudflare
 
 ```bash
-# Pastikan DNS sudah propagate dulu (cek dengan dig atau nslookup)
-nslookup storage.sangkaraprasetya.site
-
-# Generate SSL
-sudo certbot --nginx -d storage.sangkaraprasetya.site
-
-# Setelah berhasil, update config nginx dengan versi lengkap di atas
-```
-
----
-
-### **STEP 5: Alternatif - Cloudflare Tunnel (Recommended)**
-
-Jika server tidak memiliki IP publik atau ingin lebih secure:
-
-#### 5.1 Install Cloudflared
-
-```bash
-# Download dan install
-curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-sudo dpkg -i cloudflared.deb
-
-# Login ke Cloudflare
 cloudflared tunnel login
 ```
 
-#### 5.2 Buat Tunnel
+Ini akan membuka browser untuk login ke akun Cloudflare. Pilih domain `sangkaraprasetya.site` ketika diminta.
+
+> Jika server tidak punya GUI, copy URL yang muncul dan buka di browser lain.
+
+### 3.2 Buat Tunnel Baru
 
 ```bash
-# Buat tunnel baru
 cloudflared tunnel create civica-storage
+```
 
-# Buat config
+**Output contoh:**
+
+```
+Tunnel credentials written to /home/user/.cloudflared/abc123-xxxx-xxxx.json
+Created tunnel civica-storage with id abc123-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+```
+
+> 📝 **CATAT TUNNEL_ID!** (contoh: `abc123-xxxx-xxxx-xxxx-xxxxxxxxxxxx`)
+
+### 3.3 Buat Config Tunnel
+
+```bash
 mkdir -p ~/.cloudflared
 nano ~/.cloudflared/config.yml
 ```
 
-Isi `config.yml`:
+Isi dengan:
 
 ```yaml
-tunnel: <TUNNEL_ID_DARI_STEP_SEBELUMNYA>
-credentials-file: /root/.cloudflared/<TUNNEL_ID>.json
+# Cloudflare Tunnel Config untuk CIVICA Storage
+# Ganti <TUNNEL_ID> dengan ID tunnel dari step 3.2
+
+tunnel: <TUNNEL_ID>
+credentials-file: /home/<USERNAME>/.cloudflared/<TUNNEL_ID>.json
 
 ingress:
+  # Storage API endpoint
   - hostname: storage.sangkaraprasetya.site
     service: http://localhost:3001
+    originRequest:
+      connectTimeout: 30s
+      noTLSVerify: false
+
+  # Catch-all rule (wajib ada di paling bawah)
   - service: http_status:404
 ```
 
-#### 5.3 Route DNS
+> ⚠️ Ganti `<TUNNEL_ID>` dan `<USERNAME>` dengan nilai yang sesuai!
+
+### 3.4 Route DNS ke Tunnel
 
 ```bash
 cloudflared tunnel route dns civica-storage storage.sangkaraprasetya.site
 ```
 
-#### 5.4 Jalankan sebagai Service
+Ini akan otomatis membuat CNAME record di Cloudflare DNS.
+
+### 3.5 Test Tunnel Manual
 
 ```bash
-sudo cloudflared service install
-sudo systemctl start cloudflared
-sudo systemctl enable cloudflared
+# Terminal 1: Jalankan API server
+cd /var/www/civica-storage
+node server.js
+
+# Terminal 2: Jalankan tunnel
+cloudflared tunnel run civica-storage
 ```
 
----
-
-### **STEP 6: Testing**
-
-#### 6.1 Test Health Check
+Test dari browser atau curl:
 
 ```bash
 curl https://storage.sangkaraprasetya.site/health
 ```
 
-Expected response:
+**Response yang diharapkan:**
 
 ```json
-{ "status": "ok", "timestamp": "2026-01-30T12:00:00.000Z" }
+{ "status": "ok", "timestamp": "2026-01-30T..." }
 ```
 
-#### 6.2 Test Upload (menggunakan curl)
+---
+
+## 🚀 STEP 4: Setup Autostart (Systemd Services)
+
+### 4.1 Setup PM2 untuk Node.js API
 
 ```bash
+cd /var/www/civica-storage
+
+# Start dengan PM2
+pm2 start server.js --name civica-storage
+
+# Simpan konfigurasi PM2
+pm2 save
+
+# Setup autostart saat boot
+pm2 startup
+# Jalankan command yang diberikan oleh PM2
+```
+
+### 4.2 Setup Cloudflared sebagai Service
+
+```bash
+sudo cloudflared service install
+```
+
+Ini akan:
+
+- Copy config ke `/etc/cloudflared/config.yml`
+- Membuat systemd service
+- Enable autostart saat boot
+
+### 4.3 Verifikasi Services
+
+```bash
+# Cek status cloudflared
+sudo systemctl status cloudflared
+
+# Cek status PM2
+pm2 status
+
+# Cek logs
+sudo journalctl -u cloudflared -f  # Logs cloudflared
+pm2 logs civica-storage             # Logs Node.js API
+```
+
+---
+
+## 🧪 STEP 5: Testing
+
+### 5.1 Health Check
+
+```bash
+curl https://storage.sangkaraprasetya.site/health
+```
+
+### 5.2 Test Upload (dengan API Key)
+
+```bash
+# Ganti YOUR_API_KEY dengan API key di .env
 curl -X POST \
   https://storage.sangkaraprasetya.site/upload/posts \
-  -H "X-API-Key: your-api-key" \
+  -H "X-API-Key: YOUR_API_KEY" \
   -F "image=@/path/to/test-image.jpg"
 ```
 
----
+**Response sukses:**
 
-### **STEP 7: Security Checklist**
-
-- [ ] Ganti `API_KEY` dengan value yang random dan aman
-- [ ] Simpan API_KEY di environment variable, jangan hardcode
-- [ ] Setup firewall (UFW)
-  ```bash
-  sudo ufw allow 22
-  sudo ufw allow 80
-  sudo ufw allow 443
-  sudo ufw enable
-  ```
-- [ ] Setup rate limiting di Nginx
-- [ ] Setup backup otomatis untuk folder uploads
-- [ ] Monitor disk space
-
----
-
-## 📝 API Endpoints
-
-| Method | Endpoint                     | Description                    | Auth |
-| ------ | ---------------------------- | ------------------------------ | ---- |
-| GET    | `/health`                    | Health check                   | No   |
-| POST   | `/upload/posts`              | Upload single image untuk post | Yes  |
-| POST   | `/upload/avatars`            | Upload avatar user             | Yes  |
-| POST   | `/upload-multiple/posts`     | Upload multiple images         | Yes  |
-| DELETE | `/delete`                    | Delete image                   | Yes  |
-| GET    | `/uploads/{type}/{filename}` | Get image (static)             | No   |
-
----
-
-## 🔐 Headers Required
-
-```
-X-API-Key: your-api-key-here
-Content-Type: multipart/form-data
+```json
+{
+  "success": true,
+  "url": "https://storage.sangkaraprasetya.site/uploads/posts/1706612345_abc123.jpg",
+  "filename": "1706612345_abc123.jpg"
+}
 ```
 
----
+### 5.3 Test Akses File
 
-## 📱 Integrasi dengan CIVICA App
-
-Setelah server siap, update file `services/storage.ts` di app React Native. File ini sudah saya update terpisah.
+Buka URL dari response di browser - gambar harus bisa diakses.
 
 ---
 
-## 🛠️ Troubleshooting
+## 🔧 Troubleshooting
 
-### Upload gagal dengan error 413
-
-- Periksa `client_max_body_size` di Nginx
-
-### SSL Certificate error
-
-- Pastikan DNS sudah propagate
-- Jalankan ulang `sudo certbot --nginx -d storage.sangkaraprasetya.site`
-
-### Connection refused
-
-- Pastikan storage-api running: `pm2 status`
-- Cek logs: `pm2 logs storage-api`
-
-### Permission denied pada folder uploads
+### Tunnel tidak jalan
 
 ```bash
-sudo chown -R www-data:www-data /var/www/storage-api/uploads
-sudo chmod -R 755 /var/www/storage-api/uploads
+# Cek status
+sudo systemctl status cloudflared
+
+# Restart tunnel
+sudo systemctl restart cloudflared
+
+# Lihat logs
+sudo journalctl -u cloudflared -n 50
+```
+
+### API tidak response
+
+```bash
+# Cek PM2
+pm2 status
+pm2 logs civica-storage
+
+# Restart API
+pm2 restart civica-storage
+```
+
+### Error 502 Bad Gateway
+
+- Pastikan Node.js server berjalan di port 3001
+- Cek apakah port sudah digunakan: `sudo lsof -i :3001`
+
+### Error 401 Unauthorized
+
+- Pastikan API Key di header sama dengan di `.env`
+- Header: `X-API-Key: your-api-key`
+
+---
+
+## 📁 Struktur File di Server
+
+```
+/var/www/civica-storage/
+├── .env                 # Environment variables (API_KEY, dll)
+├── server.js            # API server
+├── package.json         # Dependencies
+├── node_modules/        # Installed packages
+└── uploads/             # Uploaded files
+    ├── posts/           # Post images
+    ├── avatars/         # User avatars
+    └── reports/         # Report attachments
+
+~/.cloudflared/
+├── config.yml           # Tunnel configuration
+├── cert.pem             # Cloudflare certificate (dari login)
+└── <TUNNEL_ID>.json     # Tunnel credentials
 ```
 
 ---
 
-## 📁 Struktur Final di Server
+## 🔐 Keamanan
 
-```
-/var/www/storage-api/
-├── server.js
-├── package.json
-├── .env
-├── node_modules/
-└── uploads/
-    ├── posts/
-    │   ├── 1706612400000_abc123.jpg
-    │   └── ...
-    └── avatars/
-        ├── 1706612500000_def456.jpg
-        └── ...
+### Yang Sudah Ditangani:
+
+1. **SSL/TLS** - Otomatis dari Cloudflare (tidak perlu setup manual)
+2. **DDoS Protection** - Built-in dari Cloudflare
+3. **API Key Authentication** - Semua upload/delete butuh API key
+4. **Rate Limiting** - 100 request per menit per IP
+5. **File Type Validation** - Hanya image yang diizinkan
+6. **File Size Limit** - Maksimal 10MB per file
+
+### Best Practices:
+
+```bash
+# Generate API Key yang aman
+openssl rand -hex 32
+
+# Jangan commit .env ke git
+echo ".env" >> .gitignore
+
+# Backup uploads folder secara berkala
+rsync -avz /var/www/civica-storage/uploads/ /backup/civica/
 ```
 
 ---
 
-**Setelah server siap**, beri tahu saya untuk update kode di CIVICA app agar menggunakan server storage baru ini!
+## 📊 Monitoring
+
+### Cloudflare Dashboard
+
+1. Login ke [Cloudflare Dashboard](https://dash.cloudflare.com)
+2. Pilih domain `sangkaraprasetya.site`
+3. Pergi ke **Traffic** untuk lihat analytics
+4. Pergi ke **Zero Trust > Networks > Tunnels** untuk status tunnel
+
+### Server Monitoring
+
+```bash
+# Real-time logs
+pm2 logs civica-storage --lines 100
+
+# Monitoring resource
+pm2 monit
+
+# Status semua service
+pm2 status
+sudo systemctl status cloudflared
+```
+
+---
+
+## 🔄 Update & Maintenance
+
+### Update Cloudflared
+
+```bash
+# Download versi terbaru
+curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+sudo dpkg -i cloudflared.deb
+
+# Restart service
+sudo systemctl restart cloudflared
+```
+
+### Update Dependencies API
+
+```bash
+cd /var/www/civica-storage
+npm update
+pm2 restart civica-storage
+```
+
+---
+
+## 📞 Quick Commands Reference
+
+| Task             | Command                                           |
+| ---------------- | ------------------------------------------------- |
+| Start API        | `pm2 start civica-storage`                        |
+| Stop API         | `pm2 stop civica-storage`                         |
+| Restart API      | `pm2 restart civica-storage`                      |
+| Logs API         | `pm2 logs civica-storage`                         |
+| Start Tunnel     | `sudo systemctl start cloudflared`                |
+| Stop Tunnel      | `sudo systemctl stop cloudflared`                 |
+| Restart Tunnel   | `sudo systemctl restart cloudflared`              |
+| Logs Tunnel      | `sudo journalctl -u cloudflared -f`               |
+| Check Status All | `pm2 status && sudo systemctl status cloudflared` |
+
+---
+
+## ✅ Checklist Setup
+
+- [ ] Node.js 18+ terinstall
+- [ ] PM2 terinstall
+- [ ] Cloudflared terinstall
+- [ ] Project folder dibuat (`/var/www/civica-storage`)
+- [ ] Dependencies terinstall (`npm install`)
+- [ ] File `.env` dibuat dengan API_KEY yang aman
+- [ ] File `server.js` ada
+- [ ] Cloudflared login sukses
+- [ ] Tunnel dibuat (`cloudflared tunnel create`)
+- [ ] Config tunnel dibuat (`~/.cloudflared/config.yml`)
+- [ ] DNS route dibuat
+- [ ] API server jalan via PM2
+- [ ] Cloudflared service terinstall
+- [ ] Health check sukses
+- [ ] Test upload sukses
+
+---
+
+**🎉 Selesai! Server CIVICA Storage sudah siap digunakan.**
