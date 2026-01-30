@@ -1,0 +1,68 @@
+# Cloudflare Tunnel Configuration
+# Lokasi: ~/.cloudflared/config.yml
+
+# Ganti <TUNNEL_ID> dengan ID tunnel yang didapat setelah menjalankan:
+# cloudflared tunnel create civica-storage
+
+tunnel: <TUNNEL_ID>
+credentials-file: /root/.cloudflared/<TUNNEL_ID>.json
+
+# Ingress rules
+ingress:
+  # Storage API
+  - hostname: storage.sangkaraprasetya.site
+    service: http://localhost:3001
+    originRequest:
+      # Timeout settings
+      connectTimeout: 30s
+      noTLSVerify: false
+
+  # Catch-all (required)
+  - service: http_status:404
+
+# ============================================================================
+# LANGKAH-LANGKAH SETUP CLOUDFLARE TUNNEL:
+# ============================================================================
+#
+# 1. Install cloudflared
+#    curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+#    sudo dpkg -i cloudflared.deb
+#
+# 2. Login ke Cloudflare (akan buka browser)
+#    cloudflared tunnel login
+#
+# 3. Buat tunnel baru
+#    cloudflared tunnel create civica-storage
+#    # Catat TUNNEL_ID yang muncul!
+#
+# 4. Buat config file
+#    mkdir -p ~/.cloudflared
+#    nano ~/.cloudflared/config.yml
+#    # Paste isi file ini, ganti <TUNNEL_ID>
+#
+# 5. Route DNS ke tunnel
+#    cloudflared tunnel route dns civica-storage storage.sangkaraprasetya.site
+#
+# 6. Test tunnel
+#    cloudflared tunnel run civica-storage
+#
+# 7. Install sebagai service
+#    sudo cloudflared service install
+#    sudo systemctl start cloudflared
+#    sudo systemctl enable cloudflared
+#
+# 8. Cek status
+#    sudo systemctl status cloudflared
+#    cloudflared tunnel info civica-storage
+#
+# ============================================================================
+# KEUNTUNGAN CLOUDFLARE TUNNEL:
+# ============================================================================
+# - Tidak perlu IP publik
+# - SSL otomatis dari Cloudflare
+# - DDoS protection
+# - Caching untuk gambar
+# - Analytics
+# - Tidak perlu buka port di firewall
+#
+# ============================================================================
